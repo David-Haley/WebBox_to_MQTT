@@ -1,0 +1,23 @@
+with "lib_mosquitto.gpr";
+with "lib_gnatcoll.gpr";
+with "lib_gnatcoll_minimal.gpr";
+project Webbox_To_Mqtt is
+
+   for Languages    use ("Ada");
+   for Source_Dirs use ("src", "../Pi_Common/src", "../DJH/src");
+   for Object_Dir use "obj";
+   for Create_Missing_Dirs use "True";
+   for Exec_Dir use "bin";
+   for Main use ("webbox_to_mqtt.adb");
+
+   package Compiler is
+     for Default_Switches ("Ada") use ("-g", "-gnat2022", "-gnatwa",
+       "-gnatVa", "-gnatyk", "-gnaty3", "-gnatya", "-gnatyk", "-gnatyl",
+       "-gnatyn", "-gnatyr", "-gnaty-d");
+   end Compiler;
+
+   package Binder is
+      for Switches ("Ada") use ("-Es"); --  Symbolic traceback
+   end Binder;
+
+end Webbox_To_Mqtt;
