@@ -3,7 +3,9 @@
 
 --  Author    : David Haley
 --  Created   : 19/04/2026
---  Last Edit : 23/04/2026
+--  Last Edit : 24/05/2026
+
+-- 20260524 : Exception handling made more robust.
 
 with Ada.Calendar; use Ada.Calendar;
 with Ada.Calendar.Formatting; use Ada.Calendar.Formatting;
@@ -14,6 +16,7 @@ with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Characters.Conversions; use Ada.Characters.Conversions;
 with Ada.Streams; use Ada.Streams;
 with Ada.Text_IO; use Ada.Text_IO;
+with Ada.Exceptions; use Ada.Exceptions;
 with GNAT.Sockets; use GNAT.Sockets;
 with GNATCOLL.JSON; use GNATCOLL.JSON;
 with Linux_Signals; use Linux_Signals;
@@ -112,9 +115,11 @@ procedure Webbox_To_Mqtt is
                               Publish_Handle);
                   end; -- JSON_String declaration block
                exception
-                  when Socket_Error =>  
-                     Put_Line ("Timed out" & Sequence_Number'Img);
-                     -- after testing can be nul;
+                  when others => 
+                     null;
+                     --  Here to deal with timeout in Receive_Socket in
+                     --  particular but other exceptions could occur. Should be
+                     --  propagated to entry caller.
                end; -- Receive exception block
             end Request_Sent;
          or
@@ -177,8 +182,12 @@ begin -- Webbox_To_Mqtt
       begin -- Tx block
          Send_Socket (Client_Socket, Tx_Buffer, Last, Webbox_Address);
          Receiver.Request_Sent (Sequence_Number);
-         Sequence_Number := @ + 1;
+      exception
+         when E : others =>
+            Put_Line ("TX sequence:" & Sequence_Number'Img & " - " &
+                      Exception_Message (E));
       end; -- Tx block
+      Sequence_Number := @ + 1;
       exit when Handlers.Signal_Stop or Ctrl_C_Stop;
       Next_Time := @ + Poll_Interval;
       delay until Next_Time;
@@ -187,4 +196,8 @@ begin -- Webbox_To_Mqtt
    Handlers.Remove; -- Remove Linux signal handlers
    Close_Socket (Client_Socket);
    Disconnect (Publish_Handle);
+exception
+   when E : others =>
+     Put_Line ("Unhandled exception - " & Exception_Message (E));
+   abort Receiver;
 end Webbox_To_Mqtt;
