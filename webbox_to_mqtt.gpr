@@ -8,7 +8,7 @@ project Webbox_To_Mqtt is
    for Object_Dir use "obj";
    for Create_Missing_Dirs use "True";
    for Exec_Dir use "bin";
-   for Main use ("webbox_to_mqtt.adb");
+   for Main use ("webbox_to_mqtt.adb", "configure_webbox_to_mqtt.adb");
 
    package Compiler is
      for Default_Switches ("Ada") use ("-g", "-gnat2022", "-gnatwa",

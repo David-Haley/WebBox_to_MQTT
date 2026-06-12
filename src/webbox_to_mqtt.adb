@@ -3,9 +3,10 @@
 
 --  Author    : David Haley
 --  Created   : 19/04/2026
---  Last Edit : 24/05/2026
+--  Last Edit : 12/06/2026
 
--- 20260524 : Exception handling made more robust.
+--  20260612 : Seperate configuration program orovided.
+--  20260524 : Exception handling made more robust.
 
 with Ada.Calendar; use Ada.Calendar;
 with Ada.Calendar.Formatting; use Ada.Calendar.Formatting;
@@ -19,8 +20,10 @@ with Ada.Text_IO; use Ada.Text_IO;
 with Ada.Exceptions; use Ada.Exceptions;
 with GNAT.Sockets; use GNAT.Sockets;
 with GNATCOLL.JSON; use GNATCOLL.JSON;
+with DJH.JSON_Configuration;
 with Linux_Signals; use Linux_Signals;
 with MQTT_Client; use MQTT_Client;
+with Common_Configuration; use Common_Configuration;
 
 procedure Webbox_To_Mqtt is
 
@@ -31,6 +34,9 @@ procedure Webbox_To_Mqtt is
    GetPlantOverview : constant String := "GetPlantOverview";
    Id : constant String := "id";
 
+   package Configuration is new
+      DJH.JSON_Configuration (Parameters, Configuration_File, Encrypted);
+   use Configuration; 
 
    procedure Publish (Sequence_Number : in Positive;
                       Reply_Time : in Time;
@@ -150,12 +156,22 @@ procedure Webbox_To_Mqtt is
    Webbox_Address, Caller_Address : Sock_Addr_Type;
 
 begin -- Webbox_To_Mqtt
+   Put_Line ("WebBox_to_MQTT version 20260612");
+   if Configuration_File_Exists then
+      Put_Line ("Reading " & Configuration_File);
+      Read_Configuration;
+   else
+      raise JSON_Configuration_Error with "Missing configuration file " &
+        Configuration_File;
+   end if; -- Configuration_File_Exists
+
    Handlers.Install; -- Install Linux signal handlers
    Caller_Address := (Family => Family_Inet,
                       Addr => Any_Inet_Addr,
                       Port => Webbox_RPC_Port);
    Webbox_Address := (Family => Family_Inet,
-                      Addr => Addresses (Get_Host_By_Name (Argument (1)), 1),
+                      Addr => Addresses (Get_Host_By_Name (Get_Value (WebBox)),
+                      1),
                       Port => Webbox_RPC_Port);
    Create_Socket (Client_Socket, Family_Inet, Socket_Datagram); -- UDP socket
    Set_Socket_Option (Client_Socket, Socket_Level, (Receive_Timeout, 5.0));
@@ -163,10 +179,10 @@ begin -- Webbox_To_Mqtt
    --  WireShark testing;
    Set_Socket_Option (Client_Socket, Socket_Level, (Reuse_Address, True));
    Bind_Socket (Client_Socket, Caller_Address);
-   Connect_Tx (Broker_Host => Argument (3),
-               User_Name => Argument (4),
-               Password => Argument (5), 
-               Topic => Argument (2),
+   Connect_Tx (Broker_Host => Get_Value (Broker),
+               User_Name => Get_Value (User),
+               Password => Get_Value (Password), 
+               Topic => Get_Value (Topic),
                Handle => Publish_Handle);
    loop -- Send request
       declare -- Tx block
@@ -196,8 +212,10 @@ begin -- Webbox_To_Mqtt
    Handlers.Remove; -- Remove Linux signal handlers
    Close_Socket (Client_Socket);
    Disconnect (Publish_Handle);
+   Set_Exit_Status (Ada.Command_Line.Success);
 exception
    when E : others =>
-     Put_Line ("Unhandled exception - " & Exception_Message (E));
+      Put_Line ("Unhandled exception - " & Exception_Message (E));
    abort Receiver;
+   Set_Exit_Status (Failure);
 end Webbox_To_Mqtt;
