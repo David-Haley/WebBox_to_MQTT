@@ -1,6 +1,6 @@
-with "lib_mosquitto.gpr";
-with "lib_gnatcoll.gpr";
-with "lib_gnatcoll_minimal.gpr";
+with "../Pi_Common/lib_mosquitto.gpr";
+with "../gnatcoll/lib_gnatcoll.gpr";
+with "../gnatcoll/lib_gnatcoll_minimal.gpr";
 project Webbox_To_Mqtt is
 
    for Languages    use ("Ada");
