@@ -3,8 +3,10 @@
 
 --  Author    : David Haley
 --  Created   : 19/04/2026
---  Last Edit : 12/06/2026
+--  Last Edit : 09/09/2026
 
+--  20260909 : Bug fix proposed by Claude to address power and yeild being
+--  reported erroneously as 0 without any error being reported.
 --  20260612 : Seperate configuration program orovided.
 --  20260524 : Exception handling made more robust.
 
@@ -44,44 +46,93 @@ procedure Webbox_To_Mqtt is
                       Publish_Handle : in MQTT_Handle) is
 
       Parsed : Read_Result;
-      Item : UTF8_Unbounded_String;
+      Id_Value, Proc_Value, Result, Overview, Entry_Object,
+        Name_Value, Value_Value : JSON_Value;
       Data_Array : JSON_Array;
       Valid, Power_Found, Yield_Found : Boolean := False;
       Clock_JSON : constant JSON_Value := Create_Object;
 
+      function Field (Object : in JSON_Value; Field_Name : in String)
+                      return JSON_Value is
+      begin -- Field
+         --  Guards against calling a typed Get on a value of the wrong
+         --  Kind, which raises Constraint_Error (Has_Field / typed Get
+         --  access the matching variant record field without a Kind
+         --  check); returns JSON_Null for a missing field or non-object.
+         if Kind (Object) = JSON_Object_Type and then
+           Has_Field (Object, Field_Name) then
+            return Get (Object, Field_Name);
+         else
+            return JSON_Null;
+         end if; -- Kind (Object) = JSON_Object_Type and then ...
+      end Field;
+
+      procedure Log_Rejected (Reason : in String) is
+      begin -- Log_Rejected
+         Put_Line ("Sequence" & Sequence_Number'Img & " rejected - " &
+                     Reason);
+         Put_Line (JSON_String);
+      end Log_Rejected;
+
    begin -- Publish
       Parsed := Read (JSON_String);
-      if Parsed.Success then
-         --  Check correct procedure call and Sequence_Number.
-         Item := Get (Parsed.Value, Id);
-         Valid := Sequence_Number = Positive'Value (To_String (Item));
-         Item := Get (Parsed.Value, Proc);
-         Valid := @ and GetPlantOverview = To_String (Item);
-         Data_Array := Get (Get (Parsed.Value, "result"), "overview");
-      else
+      if not Parsed.Success then
          Put_Line (JSON_String);
-         Put_Line (Format_Parsing_Error(Parsed.Error));
-      end if; -- Parsed.Success
-      if Valid then
-         for I in Natural range 1 .. Length (Data_Array) loop
-            Item := Get (Get (Data_Array, I), "name");
-            if Item = To_Unbounded_String ("GriPwr") then
+         Put_Line (Format_Parsing_Error (Parsed.Error));
+         return;
+      end if; -- not Parsed.Success
+      Id_Value := Field (Parsed.Value, Id);
+      if Kind (Id_Value) /= JSON_String_Type then
+         Log_Rejected ("id field missing or not a string");
+         return;
+      end if; -- Kind (Id_Value) /= JSON_String_Type
+      begin -- Sequence_Number parse block
+         Valid := Sequence_Number =
+           Positive'Value (To_String (Get (Id_Value)));
+      exception
+         when Constraint_Error =>
+            Log_Rejected ("id is not a valid sequence number");
+            return;
+      end; -- Sequence_Number parse block
+      if not Valid then
+         Log_Rejected ("sequence number mismatch");
+         return;
+      end if; -- not Valid
+      Proc_Value := Field (Parsed.Value, Proc);
+      if Kind (Proc_Value) /= JSON_String_Type or else
+        To_String (Get (Proc_Value)) /= GetPlantOverview then
+         Log_Rejected ("unexpected or missing proc");
+         return;
+      end if; -- Kind (Proc_Value) /= JSON_String_Type or else ...
+      Result := Field (Parsed.Value, "result");
+      Overview := Field (Result, "overview");
+      if Kind (Overview) /= JSON_Array_Type then
+         Log_Rejected ("result/overview missing or not an array");
+         return;
+      end if; -- Kind (Overview) /= JSON_Array_Type
+      Data_Array := Get (Overview);
+      for I in Natural range 1 .. Length (Data_Array) loop
+         Entry_Object := Get (Data_Array, I);
+         Name_Value := Field (Entry_Object, "name");
+         Value_Value := Field (Entry_Object, "value");
+         if Kind (Name_Value) = JSON_String_Type and then
+           Kind (Value_Value) = JSON_String_Type then
+            if To_String (Get (Name_Value)) = "GriPwr" then
                Power_Found := True;
-               Item := Get (Get (Data_Array, I), "value");
-               Set_Field (Clock_JSON, "power", To_String (Item));
-            end if; -- Item = To_Unbounded_String ("GriPwr")
-            if Item = To_Unbounded_String ("GriEgyTdy") then
+               Set_Field (Clock_JSON, "power", To_String (Get (Value_Value)));
+            elsif To_String (Get (Name_Value)) = "GriEgyTdy" then
                Yield_Found := True;
-               Item := Get (Get (Data_Array, I), "value");
-               Set_Field (Clock_JSON, "daily_yeild", To_String (Item));
-            end if; -- Item = To_Unbounded_String ("GriEgyTdy")
-         end loop; -- I in Natural range 1 .. Length (Data_Array)
-         Valid := @ and Power_Found and Yield_Found;
-         Set_Field (Clock_JSON, "message_time_utc", Image (Reply_Time));
-      end if; -- Valid
-      if Valid then
-         Send (Publish_Handle, Write (Clock_JSON));
-      end if; -- Valid
+               Set_Field (Clock_JSON, "daily_yeild",
+                          To_String (Get (Value_Value)));
+            end if; -- To_String (Get (Name_Value)) = "GriPwr"
+         end if; -- Kind (Name_Value) = JSON_String_Type and then ...
+      end loop; -- I in Natural range 1 .. Length (Data_Array)
+      if not (Power_Found and Yield_Found) then
+         Log_Rejected ("GriPwr or GriEgyTdy not found in overview");
+         return;
+      end if; -- not (Power_Found and Yield_Found)
+      Set_Field (Clock_JSON, "message_time_utc", Image (Reply_Time));
+      Send (Publish_Handle, Write (Clock_JSON));
    end Publish;
 
    --  Global variables used by Receiver and main program
@@ -121,11 +172,22 @@ procedure Webbox_To_Mqtt is
                               Publish_Handle);
                   end; -- JSON_String declaration block
                exception
-                  when others => 
-                     null;
-                     --  Here to deal with timeout in Receive_Socket in
-                     --  particular but other exceptions could occur. Should be
-                     --  propagated to entry caller.
+                  when E : Socket_Error =>
+                     if Resolve_Exception (E) /=
+                       Resource_Temporarily_Unavailable then
+                        Put_Line ("Sequence" & Sequence_Number'Img &
+                                    " receive error - " &
+                                    Exception_Message (E));
+                     end if; -- Resolve_Exception (E) /= ...
+                     --  Resource_Temporarily_Unavailable is the expected
+                     --  Receive_Socket timeout (SO_RCVTIMEO), silently
+                     --  ignored; any other socket error is logged.
+                  when E : others =>
+                     Put_Line ("Sequence" & Sequence_Number'Img &
+                                 " unexpected error - " &
+                                 Exception_Information (E));
+                     --  Logged rather than swallowed so a JSON/parsing bug
+                     --  is visible instead of silently dropping the reply.
                end; -- Receive exception block
             end Request_Sent;
          or
@@ -156,7 +218,7 @@ procedure Webbox_To_Mqtt is
    Webbox_Address, Caller_Address : Sock_Addr_Type;
 
 begin -- Webbox_To_Mqtt
-   Put_Line ("WebBox_to_MQTT version 20260612");
+   Put_Line ("WebBox_to_MQTT version 20260909");
    if Configuration_File_Exists then
       Put_Line ("Reading " & Configuration_File);
       Read_Configuration;
