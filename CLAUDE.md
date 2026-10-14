@@ -72,8 +72,13 @@ control:
 
 Both tasks share `Client_Socket` and `Publish_Handle` as procedure-level
 globals. The request/reply exchange is correlated by a `Sequence_Number`
-embedded as the JSON `id` field and checked in `Publish` before publishing —
-mismatched or malformed replies are silently dropped rather than raising.
+embedded as the JSON `id` field and checked in `Publish` before publishing.
+A reply with an id lower than expected is a late reply to an earlier request
+still queued on the socket: `Publish` reports it as `Stale` and `Receiver`
+receives again (until `Reply_Timeout` after the request) to get the current
+reply. Without this, one late reply would leave every later cycle reading the
+previous cycle's reply. Other mismatched or malformed replies are logged and
+dropped rather than raising.
 
 Wide-string/byte-buffer conversion between the socket layer (`Stream_Element_Array`)
 and the WebBox's wide-character protocol is done via `pragma Import (Ada, ...)`

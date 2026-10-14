@@ -3,8 +3,11 @@
 
 --  Author    : David Haley
 --  Created   : 19/04/2026
---  Last Edit : 09/09/2026
+--  Last Edit : 14/10/2026
 
+--  20261014 : Stale replies (id lower than expected) discarded and receive
+--  retried, so one late reply no longer leaves every subsequent reply out of
+--  step by one sequence number.
 --  20260909 : Bug fix proposed by Claude to address power and yeild being
 --  reported erroneously as 0 without any error being reported.
 --  20260612 : Seperate configuration program orovided.
@@ -30,6 +33,9 @@ with Common_Configuration; use Common_Configuration;
 procedure Webbox_To_Mqtt is
 
    Webbox_RPC_Port : constant Port_Type := 34268;
+   Reply_Timeout : constant Duration := 5.0;
+   --  Should be an absolute eternity, typical time to reply was 300 ms in
+   --  WireShark testing.
 
    --  Webbox JSON identifiers
    Proc : constant String := "proc";
@@ -43,13 +49,17 @@ procedure Webbox_To_Mqtt is
    procedure Publish (Sequence_Number : in Positive;
                       Reply_Time : in Time;
                       JSON_String : in String;
-                      Publish_Handle : in MQTT_Handle) is
+                      Publish_Handle : in MQTT_Handle;
+                      Stale : out Boolean) is
+   --  Stale is set True if the reply is for an earlier request, in which case
+   --  the caller should receive again to obtain the reply to this request.
 
       Parsed : Read_Result;
       Id_Value, Proc_Value, Result, Overview, Entry_Object,
         Name_Value, Value_Value : JSON_Value;
       Data_Array : JSON_Array;
-      Valid, Power_Found, Yield_Found : Boolean := False;
+      Reply_Id : Positive := Positive'First;
+      Power_Found, Yield_Found : Boolean := False;
       Clock_JSON : constant JSON_Value := Create_Object;
 
       function Field (Object : in JSON_Value; Field_Name : in String)
@@ -75,6 +85,7 @@ procedure Webbox_To_Mqtt is
       end Log_Rejected;
 
    begin -- Publish
+      Stale := False;
       Parsed := Read (JSON_String);
       if not Parsed.Success then
          Put_Line (JSON_String);
@@ -87,17 +98,21 @@ procedure Webbox_To_Mqtt is
          return;
       end if; -- Kind (Id_Value) /= JSON_String_Type
       begin -- Sequence_Number parse block
-         Valid := Sequence_Number =
-           Positive'Value (To_String (Get (Id_Value)));
+         Reply_Id := Positive'Value (To_String (Get (Id_Value)));
       exception
          when Constraint_Error =>
             Log_Rejected ("id is not a valid sequence number");
             return;
       end; -- Sequence_Number parse block
-      if not Valid then
+      if Reply_Id < Sequence_Number then
+         Stale := True;
+         Put_Line ("Sequence" & Sequence_Number'Img & " stale reply id" &
+                     Reply_Id'Img & " discarded");
+         return;
+      elsif Reply_Id /= Sequence_Number then
          Log_Rejected ("sequence number mismatch");
          return;
-      end if; -- not Valid
+      end if; -- Reply_Id < Sequence_Number
       Proc_Value := Field (Parsed.Value, Proc);
       if Kind (Proc_Value) /= JSON_String_Type or else
         To_String (Get (Proc_Value)) /= GetPlantOverview then
@@ -161,34 +176,47 @@ procedure Webbox_To_Mqtt is
       while Run loop
          select
             accept Request_Sent (Sequence_Number : in Positive) do
-               begin -- Receive exception block
-                  Receive_Socket (Client_Socket, Rx_Buffer, Last);
-                  declare -- JSON_String declaration block
-                     Reply_Time : constant Time := Clock;
-                     JSON_String : constant String :=
-                       To_String (Rx_Wide_JSON (1 .. Positive (Last / 2)));
-                  begin -- JSON_String declaration block
-                     Publish (Sequence_Number, Reply_Time, JSON_String,
-                              Publish_Handle);
-                  end; -- JSON_String declaration block
-               exception
-                  when E : Socket_Error =>
-                     if Resolve_Exception (E) /=
-                       Resource_Temporarily_Unavailable then
-                        Put_Line ("Sequence" & Sequence_Number'Img &
-                                    " receive error - " &
-                                    Exception_Message (E));
-                     end if; -- Resolve_Exception (E) /= ...
-                     --  Resource_Temporarily_Unavailable is the expected
-                     --  Receive_Socket timeout (SO_RCVTIMEO), silently
-                     --  ignored; any other socket error is logged.
-                  when E : others =>
-                     Put_Line ("Sequence" & Sequence_Number'Img &
-                                 " unexpected error - " &
-                                 Exception_Information (E));
-                     --  Logged rather than swallowed so a JSON/parsing bug
-                     --  is visible instead of silently dropping the reply.
-               end; -- Receive exception block
+               declare -- Receive until reply to this request block
+                  Deadline : constant Time := Clock + Reply_Timeout;
+                  Stale : Boolean := True;
+               begin -- Receive until reply to this request block
+                  while Stale and Clock < Deadline loop
+                     --  A reply that arrived after the previous request timed
+                     --  out remains queued on the socket; it is discarded and
+                     --  the receive repeated to obtain the current reply.
+                     Stale := False;
+                     begin -- Receive exception block
+                        Receive_Socket (Client_Socket, Rx_Buffer, Last);
+                        declare -- JSON_String declaration block
+                           Reply_Time : constant Time := Clock;
+                           JSON_String : constant String :=
+                             To_String (Rx_Wide_JSON (1 .. Positive (Last / 2)));
+                        begin -- JSON_String declaration block
+                           Publish (Sequence_Number, Reply_Time, JSON_String,
+                                    Publish_Handle, Stale);
+                        end; -- JSON_String declaration block
+                     exception
+                        when E : Socket_Error =>
+                           if Resolve_Exception (E) /=
+                             Resource_Temporarily_Unavailable then
+                              Put_Line ("Sequence" & Sequence_Number'Img &
+                                          " receive error - " &
+                                          Exception_Message (E));
+                           end if; -- Resolve_Exception (E) /= ...
+                           --  Resource_Temporarily_Unavailable is the
+                           --  expected Receive_Socket timeout (SO_RCVTIMEO),
+                           --  silently ignored; any other socket error is
+                           --  logged.
+                        when E : others =>
+                           Put_Line ("Sequence" & Sequence_Number'Img &
+                                       " unexpected error - " &
+                                       Exception_Information (E));
+                           --  Logged rather than swallowed so a JSON/parsing
+                           --  bug is visible instead of silently dropping the
+                           --  reply.
+                     end; -- Receive exception block
+                  end loop; -- Stale and Clock < Deadline
+               end; -- Receive until reply to this request block
             end Request_Sent;
          or
             accept Stop do
@@ -218,7 +246,7 @@ procedure Webbox_To_Mqtt is
    Webbox_Address, Caller_Address : Sock_Addr_Type;
 
 begin -- Webbox_To_Mqtt
-   Put_Line ("WebBox_to_MQTT version 20260909");
+   Put_Line ("WebBox_to_MQTT version 20261014");
    if Configuration_File_Exists then
       Put_Line ("Reading " & Configuration_File);
       Read_Configuration;
@@ -236,9 +264,8 @@ begin -- Webbox_To_Mqtt
                       1),
                       Port => Webbox_RPC_Port);
    Create_Socket (Client_Socket, Family_Inet, Socket_Datagram); -- UDP socket
-   Set_Socket_Option (Client_Socket, Socket_Level, (Receive_Timeout, 5.0));
-   --  Should be an absolute eternity, typical time to reply was 300 ms in
-   --  WireShark testing;
+   Set_Socket_Option (Client_Socket, Socket_Level,
+                      (Receive_Timeout, Reply_Timeout));
    Set_Socket_Option (Client_Socket, Socket_Level, (Reuse_Address, True));
    Bind_Socket (Client_Socket, Caller_Address);
    Connect_Tx (Broker_Host => Get_Value (Broker),
