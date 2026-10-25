@@ -3,13 +3,13 @@
 
 --  Author    : Devid Haley
 --  Created   : 12/06/2026
---  Last_edit : 18/10/2026
+--  Last_edit : 24/10/2026
 
--- 20261018 : Inverter added.
+-- 20261018 : Inverter ans Inverter_Password added.
 
 package Common_Configuration is
 
-   type Parameters is (WebBox, Inverter, Broker, User, Password, Topic);
+   type Parameters is (WebBox, Inverter, Inverter_Password, Broker, User, Password, Topic);
 
    Configuration_File : constant String := "WebBox_to_MQTT_Configuration.json";
 
