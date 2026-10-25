@@ -6,9 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WebBox_to_MQTT is an Ada program that polls an SMA WebBox solar inverter gateway
 via UDP remote procedure call (a JSON payload over a proprietary `RPC=` framing),
-extracts the current grid power (`GriPwr`) and daily yield (`GriEgyTdy`), and
-publishes them as JSON to an MQTT broker every 30 seconds (the minimum interval
-recommended by the SMA manual).
+extracts the current grid power (`GriPwr`) and daily yield (`GriEgyTdy`) plus
+every process-data channel of one configured inverter, and publishes them as
+JSON to an MQTT broker. Remote procedure calls are at least 30 seconds apart
+(the minimum interval recommended by the SMA manual), so with two calls per
+cycle a message is published every 60 seconds.
 
 ## Build
 
@@ -44,13 +46,21 @@ Compiler switches (see `webbox_to_mqtt.gpr`) enforce `-gnat2022`, full warnings
 
 Both executables share the `Common_Configuration` package (`src/common_configuration.ads`),
 which defines the set of configuration parameters as an enumeration
-(`WebBox, Broker, User, Password, Topic`) and which of them are stored
-encrypted (`Password` only). This enum is passed as a generic parameter to
-`DJH.JSON_Configuration`, instantiated separately in each main program
-(`webbox_to_mqtt.adb` and `configure_webbox_to_mqtt.adb`), which reads/writes
-`WebBox_to_MQTT_Configuration.json` next to the executable. Run
-`configure_webbox_to_mqtt` first to create this file — `webbox_to_mqtt` raises
-`JSON_Configuration_Error` and exits if it's missing.
+(`WebBox, Inverter, Broker, User, Password, Topic`) and which of them are
+stored encrypted (`Password` only). `Inverter` is the WebBox device key of the
+inverter to report on (e.g. `WRTL1ECD:2100583664`). No RPC `passwd` field is
+sent; the WebBox has not required one for the read-only calls used. This enum
+is passed as a generic parameter to `DJH.JSON_Configuration`, instantiated
+separately in each main program (`webbox_to_mqtt.adb` and
+`configure_webbox_to_mqtt.adb`), which reads/writes `WebBox_to_MQTT_Configuration.json` in the **current working
+directory** (not next to the executable). For local testing, a configuration
+file lives in `bin/Test_Area`, so run `cd bin/Test_Area && ../webbox_to_mqtt`.
+Run `configure_webbox_to_mqtt` first to create this file — `webbox_to_mqtt`
+raises `JSON_Configuration_Error` and exits if it's missing.
+
+Only one instance may run at a time on a machine: the socket binds port 34268
+with `Reuse_Address`, so two instances steal each other's replies (seen as
+timeouts and mismatched sequence numbers).
 
 To add a new configuration field: add a value to `Parameters` in
 `common_configuration.ads`, update `Encrypted` in `common_configuration.adb` if
@@ -61,33 +71,52 @@ it should be stored encrypted, and read it via `Get_Value` in `webbox_to_mqtt.ad
 The main program is a single procedure built around two concurrent threads of
 control:
 
-- **Main task**: on a fixed 30 s cycle (`Poll_Interval`), builds a WebBox RPC
-  request (`Overview_Request`) as a `Wide_String` (the WebBox protocol expects
-  UTF-16-ish wide characters prefixed with `RPC=`), sends it over a UDP socket,
-  then calls `Receiver.Request_Sent` and waits for the next `delay until` tick.
-- **`Receiver` task**: blocks on `Receive_Socket` (5 s timeout) for the reply to
-  each request, parses the JSON response, and calls `Publish` to extract fields
-  and send the result over MQTT. Any exception during receive/parse (including
-  timeout) is swallowed so the polling loop is not disrupted.
+- **Main task**: builds WebBox RPC requests as `Wide_String`s (the WebBox
+  protocol expects UTF-16-ish wide characters prefixed with `RPC=`), sends
+  them with `Send_Request` and collects replies with `Receive_Reply`, waiting
+  `Poll_Interval` (30 s) with `delay until` between every call:
+  1. At startup, `Get_Inverter_Channels` calls `GetProcessDataChannels`
+     (`Channels_Request`) and fills the keys of `Inv_Field_List` (an ordered
+     map of channel name → value/unit), retrying until it succeeds, then
+     prints the number of channels found.
+  2. Each cycle: `GetPlantOverview` (`Overview_Request`), then
+     `Get_Process_Data` calls `GetProcessData` (`Process_Data_Request`, which
+     asks for every key in `Inv_Field_List`) to update values and units,
+     then `Publish` — only if both calls in the cycle succeeded.
+- **`Receiver` task**: on each `Request_Sent` rendezvous, blocks on
+  `Receive_Socket` (5 s timeout) and returns the raw reply text. Any exception
+  during receive (including timeout) is swallowed so the polling loop is not
+  disrupted.
 
-Both tasks share `Client_Socket` and `Publish_Handle` as procedure-level
+`Publish` sends one flat JSON object over MQTT: `power`, `daily_yeild`,
+`message_time_utc`, plus every `Inv_Field_List` entry with a value, as
+`"Name":"ValueUnit"` (e.g. `"Pac":"177W"`). `message_time_utc` is the time
+the `GetProcessData` reply was received; `power` and `daily_yeild` come from
+the overview reply about 30 s earlier in the same cycle.
+
+`Client_Socket`, `Webbox_Address` and `Publish_Handle` are procedure-level
 globals. The request/reply exchange is correlated by a `Sequence_Number`
-embedded as the JSON `id` field and checked in `Publish` before publishing.
-A reply with an id lower than expected is a late reply to an earlier request
-still queued on the socket: `Publish` reports it as `Stale` and `Receiver`
-receives again (until `Reply_Timeout` after the request) to get the current
-reply. Without this, one late reply would leave every later cycle reading the
-previous cycle's reply. Other mismatched or malformed replies are logged and
-dropped rather than raising.
+embedded as the JSON `id` field and checked by `Check_Sequence` in
+`Receive_Reply`. `Sequence_Number` is incremented after **every** call,
+successful or not, so ids are never reused across different procs. A reply
+with an id lower than expected is a late reply to an earlier request still
+queued on the socket: it is reported as `Stale` and `Receive_Reply` receives
+again (until `Reply_Timeout` after the request) to get the current reply.
+Without this, one late reply would leave every later cycle reading the
+previous cycle's reply. Each reply parser also checks `proc`. Other mismatched
+or malformed replies are logged and dropped rather than raising.
 
 Wide-string/byte-buffer conversion between the socket layer (`Stream_Element_Array`)
 and the WebBox's wide-character protocol is done via `pragma Import (Ada, ...)`
-address overlays (`Rx_Wide_JSON`/`Tx_Buffer`), not explicit encoding calls — be
-careful with buffer sizing if touching this code.
+address overlays (`Rx_Wide_Reply` in `Receiver`, `Tx_Buffer` in
+`Send_Request`), not explicit encoding calls — be careful with buffer sizing
+if touching this code. The receive buffer is 65536 bytes (the largest UDP
+payload, since `GetProcessData` replies are large) and lives on `Receiver`'s
+stack, hence its `pragma Storage_Size`.
 
 Shutdown is cooperative: `Linux_Signals.Handlers` traps `SIGTERM`, and `Ctrl_C_Stop`
-covers interactive termination; the main loop checks both after each send and,
-on exit, stops the `Receiver` task, closes the socket, and disconnects MQTT. Any
+covers interactive termination; the main loop (and the startup channel retry
+loop) checks both after each remote procedure call and, on exit, stops the `Receiver` task, closes the socket, and disconnects MQTT. Any
 unhandled exception at the top level is caught, logged, and aborts `Receiver`
 before setting a failure exit status.
 

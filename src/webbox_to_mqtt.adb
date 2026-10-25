@@ -10,7 +10,8 @@
 --  reuse by all remote procedure calls. Receive buffer enlarged.
 --  Inv_Field_List values and units updated by GetProcessData after each
 --  GetPlantOverview, Poll_Interval maintained between all calls. All
---  Inv_Field_List fields published as "Name":"ValueUnit".
+--  Inv_Field_List fields published as "Name":"ValueUnit". Published after
+--  GetProcessData, message_time_utc is the GetProcessData reply time.
 --  20261014 : Stale replies (id lower than expected) discarded and receive
 --  retried, so one late reply no longer leaves every subsequent reply out of
 --  step by one sequence number.
@@ -146,7 +147,7 @@ procedure Webbox_To_Mqtt is
          return;
       end if; -- not (Power_Found and Yield_Found)
       for C in Inv_Field_List.Iterate loop
-         --  Fields without a value (GetProcessData not yet successful) are
+         --  Fields without a value (not in the GetProcessData reply) are
          --  omitted.
          if Inv_Field_List (C).Value /= Null_Unbounded_String then
             Set_Field (Clock_JSON, To_String (Key (C)),
@@ -401,9 +402,6 @@ procedure Webbox_To_Mqtt is
       end loop; -- Channels request
       Put_Line ("Inverter " & Get_Value (Inverter) & " channels:" &
                 Ada.Containers.Count_Type'Image (Length (Inv_Field_List)));
-      for C in Inv_Field_List.Iterate loop
-         Put_Line (To_String (Key (C)));
-      end loop; -- C in Inv_Field_List.Iterate
    end Get_Inverter_Channels;
 
    function Process_Data_Request (Sequence_Number : in Sequence_Numbers;
@@ -434,10 +432,13 @@ procedure Webbox_To_Mqtt is
 
    procedure Get_Process_Data
      (Inv_Field_List : in out Inv_Field_Lists.Map;
-      Sequence_Number : in out Sequence_Numbers) is
+      Sequence_Number : in out Sequence_Numbers;
+      Data_Time : out Time;
+      Updated : out Boolean) is
 
       --  Updates the values and units in Inv_Field_List for the configured
-      --  inverter.
+      --  inverter. Updated is True if successful, Data_Time is the time the
+      --  reply was received.
 
       Label : constant String := "Process data";
       Reply : Unbounded_String;
@@ -519,12 +520,15 @@ procedure Webbox_To_Mqtt is
          if not Device_Found then
             Log_Rejected ("no channels for " & Get_Value (Inverter));
          end if; -- not Device_Found
+         Updated := Device_Found;
       end Update_Fields;
 
    begin -- Get_Process_Data
+      Updated := False;
       Send_Request (Sequence_Number,
                     Process_Data_Request (Sequence_Number, Inv_Field_List));
       Receive_Reply (Label, Sequence_Number, Reply, Reply_Time, Status);
+      Data_Time := Reply_Time;
       if Status = Valid then
          Update_Fields (Reply);
       end if; -- Status = Valid
@@ -536,6 +540,7 @@ procedure Webbox_To_Mqtt is
    Plant : Unbounded_String;
    Reply_Time : Time;
    Status : Reply_Status;
+   Updated : Boolean;
    Caller_Address : Sock_Addr_Type;
    Inv_Field_List : Inv_Field_Lists.Map := Inv_Field_Lists.Empty_Map;
 
@@ -571,16 +576,17 @@ begin -- Webbox_To_Mqtt
    while not (Handlers.Signal_Stop or Ctrl_C_Stop) loop -- Send request
       Send_Request (Sequence_Number, Overview_Request (Sequence_Number));
       Receive_Reply ("Plant", Sequence_Number, Plant, Reply_Time, Status);
-      if Status = Valid then
-         Publish (Reply_Time, Plant, Inv_Field_List, Publish_Handle);
-      end if; -- Status = Valid
       Sequence_Number := @ + 1;
       --  Always incremented so that a late reply to a failed request is
       --  recognised as stale by the next request, whatever its proc.
       exit when Handlers.Signal_Stop or Ctrl_C_Stop;
       Next_Time := @ + Poll_Interval;
       delay until Next_Time;
-      Get_Process_Data (Inv_Field_List, Sequence_Number);
+      Get_Process_Data (Inv_Field_List, Sequence_Number, Reply_Time, Updated);
+      if Status = Valid and Updated then
+         --  Reply_Time is now that of GetProcessData
+         Publish (Reply_Time, Plant, Inv_Field_List, Publish_Handle);
+      end if; -- Status = Valid and Updated
       exit when Handlers.Signal_Stop or Ctrl_C_Stop;
       Next_Time := @ + Poll_Interval;
       delay until Next_Time;
